@@ -1,0 +1,73 @@
+
+type MySchema struct {
+	*Schema
+}
+
+//覆盖原有函数
+func (ms *MySchema) Exec(ctx context.Context, queryString string, operationName string, variables map[string]interface{}) (*Response, *query.Operation) {
+	if ms.res == nil {
+		panic("schema created without resolver, can not exec")
+	}
+	return ms.exec(ctx, queryString, operationName, variables, ms.res)
+}
+
+func (ms *MySchema) exec(ctx context.Context, queryString string, operationName string, variables map[string]interface{}, res *resolvable.Schema) (*Response, *query.Operation) {
+	doc, qErr := query.Parse(queryString)
+	if qErr != nil {
+		return &Response{Errors: []*errors.QueryError{qErr}}, nil
+	}
+
+	validationFinish := ms.validationTracer.TraceValidation()
+	errs := validation.Validate(ms.schema, doc, variables, ms.maxDepth)
+	validationFinish(errs)
+	if len(errs) != 0 {
+		return &Response{Errors: errs}, nil
+	}
+
+	op, err := getOperation(doc, operationName)
+	if err != nil {
+		return &Response{Errors: []*errors.QueryError{errors.Errorf("%s", err)}}, nil
+	}
+
+	r := &exec.Request{
+		Request: selected.Request{
+			Doc:    doc,
+			Vars:   variables,
+			Schema: ms.schema,
+		},
+		Limiter: make(chan struct{}, ms.maxParallelism),
+		Tracer:  ms.tracer,
+		Logger:  ms.logger,
+	}
+	varTypes := make(map[string]*introspection.Type)
+	for _, v := range op.Vars {
+		t, err := common.ResolveType(v.Type, ms.schema.Resolve)
+		if err != nil {
+			return &Response{Errors: []*errors.QueryError{err}}, nil
+		}
+		varTypes[v.Name.Name] = introspection.WrapType(t)
+	}
+	traceCtx, finish := ms.tracer.TraceQuery(ctx, queryString, operationName, variables, varTypes)
+	data, errs := r.Execute(traceCtx, res, op)
+	finish(errs)
+
+	return &Response{
+		Data:   data,
+		Errors: errs,
+	}, op
+}
+
+//解析参数
+func GetOperationMetrics(op *query.Operation) map[string]string {
+	result := map[string]string{}
+	if op == nil || len(op.Selections) < 1 {
+		return result
+	}
+	//取第一个，第一级resolver一般不会有同时调用多个的情况
+	//第一级以下的resolver 一般为子查询，暂不记录
+	filed, _ := op.Selections[0].(*query.Field)
+	result["type"] = string(op.Type)
+	result["method"] = filed.Name.Name
+	result["alias"] = filed.Name.Name
+	return result
+}
